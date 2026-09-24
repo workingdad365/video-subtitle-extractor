@@ -1,5 +1,6 @@
 import os
 import re
+import traceback
 from multiprocessing import Queue, Process
 import cv2
 from PIL import ImageFont, ImageDraw, Image
@@ -17,7 +18,7 @@ from backend.config import tr
 
 
 def extract_subtitles(data, text_recogniser, img, raw_subtitles,
-                      sub_area, options, dt_box_arg, rec_res_arg, ocr_loss_debug_path):
+                      sub_area, options, dt_box_arg, rec_res_arg, ocr_loss_debug_path, progress_queue=None):
     """
     提取视频帧中的字幕信息
     """
@@ -41,6 +42,7 @@ def extract_subtitles(data, text_recogniser, img, raw_subtitles,
     for content, coordinate in zip(text_res, coordinates):
         text = content[0]
         prob = content[1]
+        log_to_queue_only = bool(getattr(options, 'OCR_LOG_TO_QUEUE_ONLY', False))
         if sub_area is not None:
             selected = False
             # 初始化超界偏差为0
@@ -79,9 +81,17 @@ def extract_subtitles(data, text_recogniser, img, raw_subtitles,
             else:
                 drop_reason = tr['Main']['OcrDropNoIntercetion']
             if drop_reason:
-                tqdm.write(tr['Main']['OcrResultWithDropReason'].format(text, round(prob * 100,1), drop_reason))
+                log_line = tr['Main']['OcrResultWithDropReason'].format(text, round(prob * 100, 1), drop_reason)
+                if not log_to_queue_only:
+                    tqdm.write(log_line)
+                if progress_queue is not None:
+                    progress_queue.put(('LOG', log_line))
             else:
-                tqdm.write(tr['Main']['OcrResult'].format(text, round(prob * 100,1)))
+                log_line = tr['Main']['OcrResult'].format(text, round(prob * 100, 1))
+                if not log_to_queue_only:
+                    tqdm.write(log_line)
+                if progress_queue is not None:
+                    progress_queue.put(('LOG', log_line))
             # 保存丢掉的识别结果
             loss_info = namedtuple('loss_info', 'text prob overflow_area_rate coordinate selected')
             loss_list.append(loss_info(text, prob, overflow_area_rate, coordinate, selected))
@@ -143,6 +153,7 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
 
     raw_subtitles = []
     processed_count = 0
+    signaled_done = False
     try:
         while True:
             try:
@@ -151,17 +162,21 @@ def ocr_task_consumer(ocr_queue, raw_subtitle_path, sub_area, video_path, option
                     # frame 是生产者统计的总帧数
                     total_tasks = frame if frame is not None else processed_count
                     progress_queue.put((-1, total_tasks))
+                    signaled_done = True
                     return
                 data['i'] = frame_no
                 extract_subtitles(data, text_recogniser, frame, raw_subtitles, sub_area, options, dt_box,
-                                    rec_res, ocr_loss_debug_path)
+                                    rec_res, ocr_loss_debug_path, progress_queue)
                 processed_count += 1
                 progress_queue.put((frame_no, processed_count))
-            except Exception as e:
-                print(e)
+            except Exception:
+                traceback.print_exc()
                 progress_queue.put(-1)
+                signaled_done = True
                 break
     finally:
+        if not signaled_done:
+            progress_queue.put(-1)
         with open(raw_subtitle_path, mode='w+', encoding='utf-8') as raw_subtitle_file:
             for line in raw_subtitles:
                 raw_subtitle_file.write(line)
@@ -179,42 +194,48 @@ def ocr_task_producer(ocr_queue, task_queue, progress_queue, video_path, raw_sub
     cap = cv2.VideoCapture(video_path)
     tbar = None
     frame_count = 0
-    while True:
-        try:
-            # 从任务队列中提取任务信息
-            total_frame_count, current_frame_no, dt_box, rec_res, total_ms, default_subtitle_area = task_queue.get(block=True)
-            if tbar is None:
-                tbar = tqdm(total=round(total_frame_count), position=1)
-            # current_frame 等于-1说明所有视频帧已经读完
-            if current_frame_no == -1:
-                # ocr识别队列加入结束标志，附带总帧数
-                ocr_queue.put((-1, frame_count, None, None))
-                # 通过 progress_queue 提前通知总帧数，让主进程可以精确计算进度
-                progress_queue.put((-2, frame_count))
-                # 更新进度条
-                tbar.update(tbar.total - tbar.n)
+    sent_stop_signal = False
+    try:
+        while True:
+            try:
+                # 从任务队列中提取任务信息
+                total_frame_count, current_frame_no, dt_box, rec_res, total_ms, default_subtitle_area = task_queue.get(block=True)
+                if tbar is None:
+                    tbar = tqdm(total=round(total_frame_count), position=1)
+                # current_frame 等于-1说明所有视频帧已经读完
+                if current_frame_no == -1:
+                    # ocr识别队列加入结束标志，附带总帧数
+                    ocr_queue.put((-1, frame_count, None, None))
+                    sent_stop_signal = True
+                    # 通过 progress_queue 提前通知总帧数，让主进程可以精确计算进度
+                    progress_queue.put((-2, frame_count))
+                    # 更新进度条
+                    tbar.update(tbar.total - tbar.n)
+                    break
+                tbar.update(round(current_frame_no - tbar.n))
+                # 设置当前视频帧
+                # 如果total_ms不为空，则使用了VSF提取字幕
+                if total_ms is not None:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, total_ms)
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_no - 1)
+                # 读取视频帧
+                ret, frame = cap.read()
+                # 如果读取成功
+                if ret:
+                    frame_count += 1
+                    # 根据默认字幕位置，则对视频帧进行裁剪，裁剪后处理
+                    if default_subtitle_area is not None:
+                        frame = frame_preprocess(default_subtitle_area, frame)
+                    ocr_queue.put((current_frame_no, frame, dt_box, rec_res))
+            except Exception:
+                traceback.print_exc()
+                progress_queue.put(-1)
                 break
-            tbar.update(round(current_frame_no - tbar.n))
-            # 设置当前视频帧
-            # 如果total_ms不为空，则使用了VSF提取字幕
-            if total_ms is not None:
-                cap.set(cv2.CAP_PROP_POS_MSEC, total_ms)
-            else:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_no - 1)
-            # 读取视频帧
-            ret, frame = cap.read()
-            # 如果读取成功
-            if ret:
-                frame_count += 1
-                # 根据默认字幕位置，则对视频帧进行裁剪，裁剪后处理
-                if default_subtitle_area is not None:
-                    frame = frame_preprocess(default_subtitle_area, frame)
-                # print(f"current_frame_no: {current_frame_no}")
-                ocr_queue.put((current_frame_no, frame, dt_box, rec_res))
-        except Exception as e:
-            print(e)
-            break
-    cap.release()
+    finally:
+        if not sent_stop_signal:
+            ocr_queue.put((-1, frame_count, None, None))
+        cap.release()
 
 
 def subtitle_extract_handler(task_queue, progress_queue, video_path, raw_subtitle_path, sub_area, options):

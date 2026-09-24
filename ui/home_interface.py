@@ -416,6 +416,8 @@ class HomeInterface(QWidget):
             sr.subtitle_output_path = output_path
             for key in options:
                 setattr(sr, key, options[key])
+            # UI 모드에서는 OCR 상세 로그를 큐로만 전달해 콘솔 중복 출력을 줄인다.
+            sr.ocr_log_to_queue_only = True
             sr.add_progress_listener(lambda progress_ocr, progress_frame_extract, progress_total, isFinished, progress_post=0: SubtitleExtractorRemoteCall.remote_call_update_progress(queue, progress_ocr, progress_frame_extract, progress_total, isFinished, progress_post))
             sr.append_output = lambda *args: SubtitleExtractorRemoteCall.remote_call_append_log(queue, args)
             sr.manage_process = lambda pid: SubtitleExtractorRemoteCall.remote_call_manage_process(queue, pid)
@@ -542,7 +544,6 @@ class HomeInterface(QWidget):
         cursor = self.output_text.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertText(text + '\n', fmt)
-        print(*args)  # 保持原始的 print 行为
         # 如果启用了自动滚动，则滚动到底部
         if self.auto_scroll:
             scrollbar = self.output_text.verticalScrollBar()

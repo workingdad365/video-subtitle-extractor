@@ -116,6 +116,12 @@ class SubtitleExtractor:
         # 如果使用GPU加速，则打印GPU加速提示
         if self.hardware_accelerator.has_accelerator():
             self.append_output(f"  {tr['Main']['AcceleratorON'].format(self.hardware_accelerator.accelerator_name)}")
+        if self.hardware_accelerator.has_cuda():
+            self.append_output("  OCR Device: GPU(CUDA)")
+        else:
+            self.append_output("  OCR Device: CPU (CUDA runtime not available in current Paddle build)")
+            if self.hardware_accelerator.has_accelerator():
+                self.append_output("  NOTE: ONNX providers are available, but PaddleOCR path still runs on CPU without CUDA.")
 
         # 打印视频帧数与帧率
         self.append_output(f"  {tr['Main']['FrameCount']}：{self.frame_count}"
@@ -138,7 +144,7 @@ class SubtitleExtractor:
         if self.sub_area is not None:
             if platform.system() in ['Windows', 'Linux', 'Darwin']:
                 # 使用GPU且使用accurate模式时才开放此方法：
-                if self.hardware_accelerator.has_accelerator() and config.mode.value == 'accurate':
+                if self.hardware_accelerator.has_cuda() and config.mode.value == 'accurate':
                     self.extract_frame_by_det()
                 else:
                     self.extract_frame_by_vsf()
@@ -153,6 +159,7 @@ class SubtitleExtractor:
         # 等待子线程完成
         subtitle_ocr_process.join()
         # 打印完成提示
+        self.update_progress(post=2)
         self.append_output(tr['Main']['FinishProcessFrame'])
         self.append_output(tr['Main']['FinishFindSub'])
 
@@ -171,7 +178,7 @@ class SubtitleExtractor:
             self.filter_scene_text()
             self.append_output(tr['Main']['FinishDeleteNonSub'])
 
-        self.update_progress(post=20)
+        self.update_progress(post=5)
 
         # 打印开始字幕生成提示
         self.append_output(tr['Main']['StartGenerateSub'])
@@ -760,13 +767,19 @@ class SubtitleExtractor:
         读取原始的raw txt，去除重复行，返回去除了重复后的字幕列表
         """
         self._concat_content_with_same_frameno()
+        self.update_progress(post=20)
+        self.append_output(tr['Main']['StartRemoveDuplicate'])
         with open(self.raw_subtitle_path, mode='r', encoding='utf-8') as r:
             lines = r.readlines()
         RawInfo = namedtuple('RawInfo', 'no content')
         content_list = []
         for line in lines:
-            frame_no = line.split('\t')[0]
-            content = line.split('\t')[2]
+            parts = line.split('\t', 2)
+            if len(parts) < 3:
+                continue
+            frame_no = parts[0]
+            # 저장 시 이스케이프한 줄바꿈을 복원
+            content = parts[2].rstrip('\n').replace('\\n', '\n')
             content_list.append(RawInfo(frame_no, content))
         # 去重后的字幕列表
         unique_subtitle_list = []
@@ -807,32 +820,123 @@ class SubtitleExtractor:
                     continue
         return unique_subtitle_list
 
+    def _parse_raw_coordinate(self, coordinate_text):
+        match = re.match(r'\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)', coordinate_text)
+        if not match:
+            return None
+        return tuple(int(value) for value in match.groups())
+
+    def _merge_same_frame_contents(self, entries):
+        positioned_entries = []
+        fallback_contents = []
+        for coordinate_text, content in entries:
+            normalized_content = content.strip()
+            if not normalized_content:
+                continue
+            coordinate = self._parse_raw_coordinate(coordinate_text)
+            if coordinate is None:
+                fallback_contents.append(normalized_content)
+                continue
+            xmin, xmax, ymin, ymax = coordinate
+            height = max(1, ymax - ymin)
+            center_y = (ymin + ymax) / 2
+            positioned_entries.append({
+                'coordinate': coordinate,
+                'content': normalized_content,
+                'xmin': xmin,
+                'center_y': center_y,
+                'height': height,
+            })
+
+        line_groups = []
+        for entry in sorted(positioned_entries, key=lambda item: (item['center_y'], item['xmin'])):
+            target_group = None
+            for group in line_groups:
+                tolerance = max(group['max_height'], entry['height']) * 0.6
+                if abs(entry['center_y'] - group['center_y']) <= tolerance:
+                    target_group = group
+                    break
+            if target_group is None:
+                target_group = {
+                    'entries': [],
+                    'center_y': entry['center_y'],
+                    'max_height': entry['height'],
+                }
+                line_groups.append(target_group)
+            target_group['entries'].append(entry)
+            entry_count = len(target_group['entries'])
+            target_group['center_y'] = ((target_group['center_y'] * (entry_count - 1)) + entry['center_y']) / entry_count
+            target_group['max_height'] = max(target_group['max_height'], entry['height'])
+
+        merged_lines = []
+        for group in sorted(line_groups, key=lambda item: item['center_y']):
+            ordered_contents = [item['content'] for item in sorted(group['entries'], key=lambda item: item['xmin'])]
+            merged_line = ' '.join(ordered_contents).replace('\n', ' ').strip()
+            if merged_line:
+                merged_lines.append(merged_line)
+
+        if fallback_contents:
+            fallback_line = ' '.join(fallback_contents).replace('\n', ' ').strip()
+            if fallback_line:
+                if merged_lines:
+                    merged_lines[-1] = f"{merged_lines[-1]} {fallback_line}".strip()
+                else:
+                    merged_lines.append(fallback_line)
+
+        merged_content = '\n'.join(merged_lines)
+
+        merged_coordinate = None
+        if positioned_entries:
+            xmin = min(item['coordinate'][0] for item in positioned_entries)
+            xmax = max(item['coordinate'][1] for item in positioned_entries)
+            ymin = min(item['coordinate'][2] for item in positioned_entries)
+            ymax = max(item['coordinate'][3] for item in positioned_entries)
+            merged_coordinate = f'({xmin}, {xmax}, {ymin}, {ymax})'
+
+        return merged_coordinate, merged_content
+
     def _concat_content_with_same_frameno(self):
         """
         将raw txt文本中具有相同帧号的字幕行合并
         """
+        self.append_output(tr['Main']['StartConcatSameFrame'])
+        self.update_progress(post=6)
         with open(self.raw_subtitle_path, mode='r', encoding='utf-8') as r:
             lines = r.readlines()
 
         # 用dict按frame_no分组，保留原始顺序
-        from collections import OrderedDict
-        grouped = OrderedDict()
-        for line in lines:
+        grouped = {}
+        total_lines = len(lines)
+        for idx, line in enumerate(lines):
             parts = line.split('\t', 2)
             if len(parts) < 3:
                 continue
             frame_no, coordinate, content = parts
             if frame_no not in grouped:
-                grouped[frame_no] = (coordinate, [])
-            grouped[frame_no][1].append(content)
+                grouped[frame_no] = []
+            grouped[frame_no].append((coordinate, content))
+            # 分组阶段进度 post: 6→12
+            if total_lines > 0 and idx % max(1, total_lines // 20) == 0:
+                self.update_progress(post=6 + int(6 * idx / total_lines))
 
+        self.update_progress(post=13)
+        total_groups = len(grouped)
         with open(self.raw_subtitle_path, mode='w', encoding='utf-8') as f:
-            for frame_no, (coordinate, contents) in grouped.items():
-                merged = ' '.join(contents).replace('\n', ' ')
-                if not merged.endswith('\n'):
-                    merged += '\n'
-                merged = unicodedata.normalize('NFKC', merged)
-                f.write(f'{frame_no}\t{coordinate}\t{merged}')
+            for write_idx, (frame_no, entries) in enumerate(grouped.items()):
+                coordinate, merged = self._merge_same_frame_contents(entries)
+                if coordinate is None and entries:
+                    coordinate = entries[0][0]
+                merged = merged.replace('\r\n', '\n').replace('\r', '\n')
+                # raw.txt는 한 줄 한 레코드 포맷이므로 내부 줄바꿈은 이스케이프해 저장
+                merged_serialized = merged.replace('\n', '\\n')
+                if not merged_serialized.endswith('\n'):
+                    merged_serialized += '\n'
+                merged_serialized = unicodedata.normalize('NFKC', merged_serialized)
+                f.write(f'{frame_no}\t{coordinate}\t{merged_serialized}')
+                # 写入阶段进度 post: 13→19
+                if total_groups > 0 and write_idx % max(1, total_groups // 20) == 0:
+                    self.update_progress(post=13 + int(6 * write_idx / total_groups))
+        self.update_progress(post=19)
 
     def _unite_coordinates(self, coordinates_list):
         """
@@ -1017,6 +1121,9 @@ class SubtitleExtractor:
                 if isinstance(value, tuple) and len(value) == 2 and value[0] == -2:
                     total_tasks = value[1]
                     continue
+                if isinstance(value, tuple) and len(value) == 2 and value[0] == 'LOG':
+                    self.append_output(value[1])
+                    continue
                 # 终止条件
                 if value == -1:
                     self.update_progress(ocr=100)
@@ -1038,6 +1145,7 @@ class SubtitleExtractor:
             'SUB_AREA_DEVIATION_RATE': config.subtitleAreaDeviationRate.value / 100.0,
             'DEBUG_OCR_LOSS': config.debugOcrLoss.value,
             'HARDWARD_ACCELERATOR': self.hardware_accelerator,
+            'OCR_LOG_TO_QUEUE_ONLY': getattr(self, 'ocr_log_to_queue_only', False),
         }
         process, task_queue, progress_queue = subtitle_ocr.async_start(self.video_path, self.raw_subtitle_path, self.sub_area, options)
         ProcessManager.instance().add_process(process)
