@@ -175,7 +175,7 @@ This project supports four runtime modes: CUDA (NVIDIA GPU acceleration), CPU (n
 - Install ONNX Runtime DirectML version:
   ```shell
   pip install paddlepaddle==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
+  pip install -r requirements_cpu.txt
   pip install -r requirements_directml.txt
   ```
 
@@ -186,7 +186,7 @@ This project supports four runtime modes: CUDA (NVIDIA GPU acceleration), CPU (n
 - Install ONNX Runtime:
   ```shell
   pip install paddlepaddle==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
+  pip install -r requirements_cpu.txt
 
   # Read the documentation at https://onnxruntime.ai/docs/execution-providers/
   # Choose the appropriate execution backend for your device.
@@ -206,7 +206,7 @@ This project supports four runtime modes: CUDA (NVIDIA GPU acceleration), CPU (n
 - Install the CPU version of PaddlePaddle directly:
   ```shell
   pip install paddlepaddle==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
+  pip install -r requirements_cpu.txt
   ```
 
 #### 5. Run the Program

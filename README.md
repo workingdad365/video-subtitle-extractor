@@ -172,7 +172,7 @@ cd <源码所在目录>
 - 安装 ONNX Runtime DirectML 版本：
   ```shell
   pip install paddlepaddle==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
+  pip install -r requirements_cpu.txt
   pip install -r requirements_directml.txt
   ```
 
@@ -183,7 +183,7 @@ cd <源码所在目录>
 - 安装 ONNX Runtime DirectML 版本：
   ```shell
   pip install paddlepaddle==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
+  pip install -r requirements_cpu.txt
 
   # 阅读文档 https://onnxruntime.ai/docs/execution-providers/
   # 根据你的设备选择合适的执行后端, 参考requirements_directml.txt文件修改成合适你环境的依赖
@@ -202,7 +202,7 @@ cd <源码所在目录>
 - 直接安装 CPU 版本 PaddlePaddle：
   ```shell
   pip install paddlepaddle==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
-  pip install -r requirements.txt
+  pip install -r requirements_cpu.txt
   ```
 
 #### 5. 运行程序
