@@ -1,4 +1,4 @@
-[简体中文](README.md) | English
+[한국어](README.md) | English | [简体中文](README_zh.md)
 
 <p align="center"><img src="https://github.com/YaoFANGUK/video-subtitle-extractor/raw/main/design/icon_1024.png" alt="VSE Logo" width="128"/></p>
 
